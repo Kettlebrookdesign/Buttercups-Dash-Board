@@ -5,6 +5,36 @@ class Buttercups_Dashboard_DB {
     private static $tables_cache = null;
     private static $extras_cache = array();
 
+    private static function get_guest_field_config($service_id) {
+        $configs = array(
+            3 => array(
+                'mode' => 'adults_children',
+                'legend' => 'Number of Guests',
+                'adult_label' => 'Adults',
+                'child_label' => 'Under 14 (Children)'
+            ),
+            14 => array(
+                'mode' => 'adults_children',
+                'legend' => 'Number of Guests',
+                'adult_label' => 'Adults',
+                'child_label' => 'Under 14 (Children)'
+            ),
+            17 => array(
+                'mode' => 'total_guests',
+                'legend' => 'Number of Guests',
+                'total_label' => 'Number of guests'
+            )
+        );
+
+        $default = array(
+            'mode' => 'total_guests',
+            'legend' => 'Number of Guests',
+            'total_label' => 'Number of guests'
+        );
+
+        return isset($configs[(int)$service_id]) ? $configs[(int)$service_id] : $default;
+    }
+
     private static function get_tables() {
         if (self::$tables_cache !== null) return self::$tables_cache;
 
@@ -567,6 +597,7 @@ class Buttercups_Dashboard_DB {
                     'id' => $s_id,
                     'title' => $app->service_title,
                     'price' => isset($app->staff_price) && $app->staff_price !== null ? (float)$app->staff_price : (float)$app->service_price,
+                    'guest_fields' => self::get_guest_field_config($s_id),
                     'extras' => isset($service_extras[$s_id]) ? $service_extras[$s_id] : array(),
                     'slots' => array()
                 );

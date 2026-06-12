@@ -13,6 +13,7 @@ const ManualBookingModal = ({ onClose, onBookingSuccess, defaultDate }) => {
   const [customerEmail, setCustomerEmail] = useState('');
   const [adults, setAdults] = useState(1);
   const [under14, setUnder14] = useState(0);
+  const [totalGuests, setTotalGuests] = useState(1);
   
   // Selected extras: mapping extraId to quantity
   const [extras, setExtras] = useState({});
@@ -54,6 +55,12 @@ const ManualBookingModal = ({ onClose, onBookingSuccess, defaultDate }) => {
 
   const selectedExp = experiences.find(e => String(e.id) === String(selectedExpId));
   const selectedSlot = selectedExp?.slots?.find(s => String(s.slot_id || s.appointment_id) === String(selectedSlotId));
+  const guestFields = selectedExp?.guest_fields || {
+    mode: 'total_guests',
+    legend: 'Number of Guests',
+    total_label: 'Number of guests'
+  };
+  const usesAdultChildFields = guestFields.mode === 'adults_children';
 
   // Handle extra quantity change
   const handleExtraQtyChange = (extraId, qty) => {
@@ -64,7 +71,7 @@ const ManualBookingModal = ({ onClose, onBookingSuccess, defaultDate }) => {
   };
 
   // Capacity validation in UI
-  const requestedPeople = Number(adults) + Number(under14);
+  const requestedPeople = usesAdultChildFields ? Number(adults) + Number(under14) : Number(totalGuests);
   const remainingSpaces = selectedSlot ? selectedSlot.remaining_spaces : 0;
   const isOverCapacity = selectedSlot && (requestedPeople > remainingSpaces);
 
@@ -107,8 +114,9 @@ const ManualBookingModal = ({ onClose, onBookingSuccess, defaultDate }) => {
       customer_name: customerName,
       customer_phone: customerPhone,
       customer_email: customerEmail,
-      adults: Number(adults),
-      under_14: Number(under14),
+      adults: usesAdultChildFields ? Number(adults) : Number(totalGuests),
+      under_14: usesAdultChildFields ? Number(under14) : 0,
+      guest_field_mode: guestFields.mode,
       extras: extras,
       internal_note: internalNote,
       payment_method: paymentMethod,
@@ -279,34 +287,49 @@ const ManualBookingModal = ({ onClose, onBookingSuccess, defaultDate }) => {
 
               {/* Step 3: Attendees Quantity */}
               <fieldset className="form-fieldset">
-                <legend>Number of Guests</legend>
-                <div className="form-grid">
-                  <div className="form-group">
-                    <label htmlFor="mb-adults">Adults</label>
+                <legend>{guestFields.legend || 'Number of Guests'}</legend>
+                {usesAdultChildFields ? (
+                  <div className="form-grid">
+                    <div className="form-group">
+                      <label htmlFor="mb-adults">{guestFields.adult_label || 'Adults'}</label>
+                      <input 
+                        id="mb-adults"
+                        type="number" 
+                        min="1" 
+                        value={adults} 
+                        onChange={(e) => setAdults(Math.max(1, parseInt(e.target.value) || 1))} 
+                        className="form-control"
+                        required
+                      />
+                    </div>
+
+                    <div className="form-group">
+                      <label htmlFor="mb-under14">{guestFields.child_label || 'Under 14 (Children)'}</label>
+                      <input 
+                        id="mb-under14"
+                        type="number" 
+                        min="0" 
+                        value={under14} 
+                        onChange={(e) => setUnder14(Math.max(0, parseInt(e.target.value) || 0))} 
+                        className="form-control"
+                        required
+                      />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="form-group guest-total-field">
+                    <label htmlFor="mb-total-guests">{guestFields.total_label || 'Number of guests'}</label>
                     <input 
-                      id="mb-adults"
+                      id="mb-total-guests"
                       type="number" 
                       min="1" 
-                      value={adults} 
-                      onChange={(e) => setAdults(Math.max(1, parseInt(e.target.value) || 1))} 
+                      value={totalGuests} 
+                      onChange={(e) => setTotalGuests(Math.max(1, parseInt(e.target.value) || 1))} 
                       className="form-control"
                       required
                     />
                   </div>
-
-                  <div className="form-group">
-                    <label htmlFor="mb-under14">Under 14 (Children)</label>
-                    <input 
-                      id="mb-under14"
-                      type="number" 
-                      min="0" 
-                      value={under14} 
-                      onChange={(e) => setUnder14(Math.max(0, parseInt(e.target.value) || 0))} 
-                      className="form-control"
-                      required
-                    />
-                  </div>
-                </div>
+                )}
 
                 {isOverCapacity && (
                   <div className="capacity-warning-box">

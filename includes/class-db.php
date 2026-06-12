@@ -611,7 +611,8 @@ class Buttercups_Dashboard_DB {
         $table_breaks = $wpdb->prefix . 'bookly_schedule_item_breaks';
         $table_holidays = $wpdb->prefix . 'bookly_holidays';
 
-        $day_index = (int)date('N', strtotime($date));
+        // Bookly stores weekdays as Sunday=1 through Saturday=7.
+        $day_index = ((int)date('w', strtotime($date))) + 1;
         $now_ts = current_time('timestamp');
 
         $staff_visibility_join = $table_staff ? "JOIN $table_staff st ON ss.staff_id = st.id AND st.visibility = 'public'" : "";

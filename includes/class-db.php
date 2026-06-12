@@ -464,17 +464,21 @@ class Buttercups_Dashboard_DB {
         global $wpdb;
 
         $ss_join = $table_ss ? "LEFT JOIN $table_ss ss ON a.service_id = ss.service_id AND a.staff_id = ss.staff_id" : "";
-        $ss_select = $table_ss ? ", ss.capacity_max as staff_capacity" : ", NULL as staff_capacity";
+        $ss_select = $table_ss ? ", ss.capacity_max as staff_capacity, ss.price as staff_price" : ", NULL as staff_capacity, NULL as staff_price";
 
-        $query = $wpdb->prepare("
+        $appointment_query = $wpdb->prepare("
             SELECT 
                 a.id as appointment_id,
                 a.service_id,
                 a.staff_id,
                 a.start_date,
                 s.title as service_title,
+                s.duration,
+                s.slot_length,
                 s.price as service_price,
-                s.capacity_max as service_capacity
+                s.capacity_max as service_capacity,
+                s.visibility,
+                s.min_time_prior_booking
                 $ss_select
             FROM $table_a a
             JOIN $table_s s ON a.service_id = s.id
@@ -483,29 +487,43 @@ class Buttercups_Dashboard_DB {
             ORDER BY a.start_date ASC
         ", $date);
 
-        $appointments = $wpdb->get_results($query);
+        $appointments = $wpdb->get_results($appointment_query);
+        $appointment_by_slot = array();
+        foreach ($appointments as $app) {
+            $key = (int)$app->service_id . ':' . (int)$app->staff_id . ':' . date('H:i:s', strtotime($app->start_date));
+            $appointment_by_slot[$key] = $app;
+        }
+
+        $generated_slots = array();
+        if ($table_ss) {
+            $generated_slots = self::get_generated_manual_booking_slots($date, $appointment_by_slot);
+        }
+
+        $all_slots = array_merge($appointments, $generated_slots);
 
         $active_attendees = array();
         if (!empty($appointments)) {
-            $appointment_ids = array_map(function($a) { return (int)$a->appointment_id; }, $appointments);
+            $appointment_ids = array_filter(array_map(function($a) { return (int)$a->appointment_id; }, $appointments));
             $ids_string = implode(',', $appointment_ids);
 
-            $ca_query = "
-                SELECT appointment_id, SUM(COALESCE(NULLIF(number_of_persons, 0), 1)) as total_booked
-                FROM $table_ca
-                WHERE appointment_id IN ($ids_string)
-                  AND (status IS NULL OR status IN ('approved', 'pending', 'done'))
-                GROUP BY appointment_id
-            ";
-            $ca_results = $wpdb->get_results($ca_query);
-            foreach ($ca_results as $row) {
-                $active_attendees[(int)$row->appointment_id] = (int)$row->total_booked;
+            if ($ids_string !== '') {
+                $ca_query = "
+                    SELECT appointment_id, SUM(COALESCE(NULLIF(number_of_persons, 0), 1)) as total_booked
+                    FROM $table_ca
+                    WHERE appointment_id IN ($ids_string)
+                      AND (status IS NULL OR status IN ('approved', 'pending', 'done'))
+                    GROUP BY appointment_id
+                ";
+                $ca_results = $wpdb->get_results($ca_query);
+                foreach ($ca_results as $row) {
+                    $active_attendees[(int)$row->appointment_id] = (int)$row->total_booked;
+                }
             }
         }
 
         $service_extras = array();
-        if (!empty($appointments) && $table_se) {
-            $service_ids = array_unique(array_map(function($a) { return (int)$a->service_id; }, $appointments));
+        if (!empty($all_slots) && $table_se) {
+            $service_ids = array_unique(array_map(function($a) { return (int)$a->service_id; }, $all_slots));
             $s_ids_string = implode(',', $service_ids);
 
             $se_query = "
@@ -531,34 +549,204 @@ class Buttercups_Dashboard_DB {
         }
 
         $experiences = array();
-        foreach ($appointments as $app) {
+        foreach ($all_slots as $app) {
             $s_id = (int)$app->service_id;
+            if (isset($app->visibility) && $app->visibility !== 'public') {
+                continue;
+            }
 
             $capacity = !empty($app->staff_capacity) ? (int)$app->staff_capacity : (!empty($app->service_capacity) ? (int)$app->service_capacity : 0);
             $booked = isset($active_attendees[(int)$app->appointment_id]) ? $active_attendees[(int)$app->appointment_id] : 0;
             $remaining = max(0, $capacity - $booked);
+            if ($capacity <= 0 || $remaining <= 0) {
+                continue;
+            }
 
             if (!isset($experiences[$s_id])) {
                 $experiences[$s_id] = array(
                     'id' => $s_id,
                     'title' => $app->service_title,
-                    'price' => (float)$app->service_price,
+                    'price' => isset($app->staff_price) && $app->staff_price !== null ? (float)$app->staff_price : (float)$app->service_price,
                     'extras' => isset($service_extras[$s_id]) ? $service_extras[$s_id] : array(),
                     'slots' => array()
                 );
             }
 
             $experiences[$s_id]['slots'][] = array(
-                'appointment_id' => (int)$app->appointment_id,
+                'appointment_id' => !empty($app->appointment_id) ? (int)$app->appointment_id : null,
+                'slot_id' => !empty($app->appointment_id) ? (string)$app->appointment_id : self::build_virtual_slot_id($s_id, (int)$app->staff_id, $app->start_date),
+                'staff_id' => (int)$app->staff_id,
                 'time' => date('H:i', strtotime($app->start_date)),
                 'capacity' => $capacity,
                 'active_attendees' => $booked,
                 'remaining_spaces' => $remaining,
-                'price' => (float)$app->service_price
+                'price' => isset($app->staff_price) && $app->staff_price !== null ? (float)$app->staff_price : (float)$app->service_price,
+                'generated' => empty($app->appointment_id)
             );
         }
 
+        foreach ($experiences as &$experience) {
+            usort($experience['slots'], function($a, $b) {
+                return strcmp($a['time'], $b['time']);
+            });
+        }
+
         return array_values($experiences);
+    }
+
+    private static function get_generated_manual_booking_slots($date, $appointment_by_slot) {
+        global $wpdb;
+        $tables_info = self::get_tables();
+        $found = $tables_info['found'];
+
+        $required = array('services', 'staff_services');
+        foreach ($required as $req) {
+            if (!isset($found[$req])) return array();
+        }
+
+        $table_s = $found['services'];
+        $table_ss = $found['staff_services'];
+        $table_staff = isset($found['staff']) ? $found['staff'] : null;
+        $table_sched = $wpdb->prefix . 'bookly_staff_schedule_items';
+        $table_breaks = $wpdb->prefix . 'bookly_schedule_item_breaks';
+        $table_holidays = $wpdb->prefix . 'bookly_holidays';
+
+        $day_index = (int)date('N', strtotime($date));
+        $now_ts = current_time('timestamp');
+
+        $staff_visibility_join = $table_staff ? "JOIN $table_staff st ON ss.staff_id = st.id AND st.visibility = 'public'" : "";
+        $query = $wpdb->prepare("
+            SELECT
+                s.id as service_id,
+                ss.staff_id,
+                s.title as service_title,
+                s.duration,
+                s.slot_length,
+                s.price as service_price,
+                ss.price as staff_price,
+                s.capacity_max as service_capacity,
+                ss.capacity_max as staff_capacity,
+                s.visibility,
+                s.min_time_prior_booking,
+                sch.id as schedule_item_id,
+                sch.start_time,
+                sch.end_time
+            FROM $table_ss ss
+            JOIN $table_s s ON ss.service_id = s.id
+            $staff_visibility_join
+            JOIN $table_sched sch ON sch.staff_id = ss.staff_id AND sch.day_index = %d
+            WHERE s.visibility = 'public'
+              AND sch.start_time IS NOT NULL
+              AND sch.end_time IS NOT NULL
+            ORDER BY s.position ASC, s.id ASC, sch.start_time ASC
+        ", $day_index);
+
+        $rows = $wpdb->get_results($query);
+        if (empty($rows)) return array();
+
+        $break_rows = $wpdb->get_results("SELECT staff_schedule_item_id, start_time, end_time FROM `$table_breaks`");
+        $breaks_by_schedule = array();
+        foreach ($break_rows as $break) {
+            $schedule_id = (int)$break->staff_schedule_item_id;
+            if (!isset($breaks_by_schedule[$schedule_id])) {
+                $breaks_by_schedule[$schedule_id] = array();
+            }
+            $breaks_by_schedule[$schedule_id][] = array(
+                'start' => self::time_to_seconds($break->start_time),
+                'end' => self::time_to_seconds($break->end_time)
+            );
+        }
+
+        $holiday_rows = $wpdb->get_results($wpdb->prepare("SELECT staff_id FROM `$table_holidays` WHERE date = %s", $date));
+        $holiday_staff = array();
+        foreach ($holiday_rows as $holiday) {
+            $holiday_staff[(int)$holiday->staff_id] = true;
+        }
+
+        $slots = array();
+        foreach ($rows as $row) {
+            if (isset($holiday_staff[(int)$row->staff_id])) {
+                continue;
+            }
+
+            $duration = max(60, (int)$row->duration);
+            $step = self::resolve_slot_step_seconds($row->slot_length, $duration);
+            $window_start = self::time_to_seconds($row->start_time);
+            $window_end = self::time_to_seconds($row->end_time);
+
+            for ($start = $window_start; $start + $duration <= $window_end; $start += $step) {
+                $end = $start + $duration;
+                if (self::overlaps_break($start, $end, isset($breaks_by_schedule[(int)$row->schedule_item_id]) ? $breaks_by_schedule[(int)$row->schedule_item_id] : array())) {
+                    continue;
+                }
+
+                $start_time = self::seconds_to_time($start);
+                $start_date = $date . ' ' . $start_time;
+                $min_prior = $row->min_time_prior_booking === null ? 0 : (int)$row->min_time_prior_booking;
+                if (strtotime($start_date) - $now_ts < $min_prior) {
+                    continue;
+                }
+
+                $key = (int)$row->service_id . ':' . (int)$row->staff_id . ':' . $start_time;
+                if (isset($appointment_by_slot[$key])) {
+                    continue;
+                }
+
+                $slot = clone $row;
+                $slot->appointment_id = null;
+                $slot->start_date = $start_date;
+                $slots[] = $slot;
+            }
+        }
+
+        return $slots;
+    }
+
+    private static function build_virtual_slot_id($service_id, $staff_id, $start_date) {
+        return 'new:' . (int)$service_id . ':' . (int)$staff_id . ':' . date('Y-m-d-H-i-s', strtotime($start_date));
+    }
+
+    private static function parse_virtual_slot_id($slot_id) {
+        if (!is_string($slot_id) || strpos($slot_id, 'new:') !== 0) return null;
+        $parts = explode(':', $slot_id);
+        if (count($parts) !== 4) return null;
+
+        $dt = DateTime::createFromFormat('Y-m-d-H-i-s', $parts[3]);
+        if (!$dt) return null;
+
+        return array(
+            'service_id' => (int)$parts[1],
+            'staff_id' => (int)$parts[2],
+            'start_date' => $dt->format('Y-m-d H:i:s')
+        );
+    }
+
+    private static function resolve_slot_step_seconds($slot_length, $duration) {
+        if ($slot_length === 'as_service_duration' || $slot_length === 'default' || $slot_length === null || $slot_length === '') {
+            return max(60, (int)$duration);
+        }
+        return max(60, (int)$slot_length);
+    }
+
+    private static function time_to_seconds($time) {
+        $parts = array_map('intval', explode(':', (string)$time));
+        return (($parts[0] ?? 0) * 3600) + (($parts[1] ?? 0) * 60) + ($parts[2] ?? 0);
+    }
+
+    private static function seconds_to_time($seconds) {
+        $hours = floor($seconds / 3600);
+        $minutes = floor(($seconds % 3600) / 60);
+        $secs = $seconds % 60;
+        return sprintf('%02d:%02d:%02d', $hours, $minutes, $secs);
+    }
+
+    private static function overlaps_break($start, $end, $breaks) {
+        foreach ($breaks as $break) {
+            if ($start < $break['end'] && $end > $break['start']) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static function get_appointment_availability($appointment_id) {
@@ -621,7 +809,9 @@ class Buttercups_Dashboard_DB {
         $table_ss = isset($found['staff_services']) ? $found['staff_services'] : null;
         $table_se = isset($found['service_extras']) ? $found['service_extras'] : null;
 
-        $appointment_id = (int)$data['appointment_id'];
+        $raw_appointment_id = $data['appointment_id'];
+        $virtual_slot = self::parse_virtual_slot_id($raw_appointment_id);
+        $appointment_id = $virtual_slot ? 0 : (int)$raw_appointment_id;
         $customer_name  = sanitize_text_field($data['customer_name']);
         $customer_phone = sanitize_text_field($data['customer_phone']);
         $customer_email = !empty($data['customer_email']) ? sanitize_email($data['customer_email']) : '';
@@ -637,9 +827,55 @@ class Buttercups_Dashboard_DB {
         // 1. Start Database Transaction
         $wpdb->query('START TRANSACTION');
 
+        if ($virtual_slot) {
+            $existing_app = $wpdb->get_row($wpdb->prepare("
+                SELECT a.id
+                FROM $table_a a
+                WHERE a.service_id = %d
+                  AND a.staff_id = %d
+                  AND a.start_date = %s
+                LIMIT 1
+                FOR UPDATE
+            ", $virtual_slot['service_id'], $virtual_slot['staff_id'], $virtual_slot['start_date']));
+
+            if ($existing_app) {
+                $appointment_id = (int)$existing_app->id;
+            } else {
+                $service_duration = (int)$wpdb->get_var($wpdb->prepare("SELECT duration FROM $table_s WHERE id = %d", $virtual_slot['service_id']));
+                if ($service_duration <= 0) {
+                    $wpdb->query('ROLLBACK');
+                    return new WP_Error('invalid_service_duration', 'The selected service has an invalid duration.', array('status' => 400));
+                }
+
+                $end_date = date('Y-m-d H:i:s', strtotime($virtual_slot['start_date']) + $service_duration);
+                $appointment_insert = $wpdb->insert($table_a, array(
+                    'location_id' => null,
+                    'staff_id' => $virtual_slot['staff_id'],
+                    'staff_any' => 0,
+                    'service_id' => $virtual_slot['service_id'],
+                    'custom_service_name' => null,
+                    'custom_service_price' => null,
+                    'start_date' => $virtual_slot['start_date'],
+                    'end_date' => $end_date,
+                    'extras_duration' => 0,
+                    'internal_note' => '',
+                    'created_from' => 'backend',
+                    'created_at' => current_time('mysql'),
+                    'updated_at' => current_time('mysql')
+                ));
+
+                if ($appointment_insert === false) {
+                    $wpdb->query('ROLLBACK');
+                    return new WP_Error('appointment_creation_failed', 'Failed to create appointment slot.', array('status' => 500));
+                }
+
+                $appointment_id = $wpdb->insert_id;
+            }
+        }
+
         // 2. Lock appointment row using FOR UPDATE to prevent race conditions
         $app = $wpdb->get_row($wpdb->prepare("
-            SELECT a.id, a.service_id, s.price as service_price, s.capacity_max as service_capacity
+            SELECT a.id, a.staff_id, a.start_date, a.service_id, s.price as service_price, s.capacity_max as service_capacity, s.min_time_prior_booking
             FROM $table_a a
             JOIN $table_s s ON a.service_id = s.id
             WHERE a.id = %d
@@ -653,6 +889,12 @@ class Buttercups_Dashboard_DB {
 
         $service_id = (int)$app->service_id;
         $service_price = (float)$app->service_price;
+
+        $min_prior = $app->min_time_prior_booking === null ? 0 : (int)$app->min_time_prior_booking;
+        if (strtotime($app->start_date) - current_time('timestamp') < $min_prior) {
+            $wpdb->query('ROLLBACK');
+            return new WP_Error('too_late_to_book', 'This service cannot be booked this close to the appointment time.', array('status' => 400));
+        }
 
         // 3. Resolve Capacity Max
         $staff_capacity = null;
@@ -871,4 +1113,3 @@ class Buttercups_Dashboard_DB {
         );
     }
 }
-

@@ -53,7 +53,7 @@ const ManualBookingModal = ({ onClose, onBookingSuccess, defaultDate }) => {
   }, [selectedExpId]);
 
   const selectedExp = experiences.find(e => String(e.id) === String(selectedExpId));
-  const selectedSlot = selectedExp?.slots?.find(s => String(s.appointment_id) === String(selectedSlotId));
+  const selectedSlot = selectedExp?.slots?.find(s => String(s.slot_id || s.appointment_id) === String(selectedSlotId));
 
   // Handle extra quantity change
   const handleExtraQtyChange = (extraId, qty) => {
@@ -103,7 +103,7 @@ const ManualBookingModal = ({ onClose, onBookingSuccess, defaultDate }) => {
     setErrorMsg('');
     
     const payload = {
-      appointment_id: Number(selectedSlotId),
+      appointment_id: selectedSlotId,
       customer_name: customerName,
       customer_phone: customerPhone,
       customer_email: customerEmail,
@@ -222,7 +222,7 @@ const ManualBookingModal = ({ onClose, onBookingSuccess, defaultDate }) => {
                       {selectedExp?.slots?.map(slot => (
                         <option 
                           key={slot.appointment_id} 
-                          value={slot.appointment_id}
+                          value={slot.slot_id || slot.appointment_id}
                           disabled={slot.remaining_spaces <= 0}
                         >
                           {slot.time} ({slot.remaining_spaces} spaces left of {slot.capacity})
